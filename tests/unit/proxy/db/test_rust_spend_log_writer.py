@@ -59,8 +59,15 @@ class FailingWriter:
     def __len__(self) -> int:
         return len(self.rows)
 
-    async def flush(self, limit: int, retention: object) -> list[dict[str, object]]:
-        raise NativeDatabaseFailure("connection refused")
+    async def flush(
+        self, limit: int, retention: object, *, disable_spend_logs: bool = False, disable_error_logs: bool = False
+    ) -> list[dict[str, object]]:
+        error = NativeDatabaseFailure("connection refused")
+        setattr(error, "failed_spend_log_pass", limit)
+        raise error
+
+    def dequeue_failed_pass(self, pass_id: int) -> list[str]:
+        return self.dequeue(pass_id)
 
     def dequeue(self, limit: int) -> list[str]:
         taken: Final = self.rows[:limit]
@@ -78,7 +85,9 @@ class WritingWriter:
     def __len__(self) -> int:
         return len(self.written)
 
-    async def flush(self, limit: int, retention: object) -> list[dict[str, object]]:
+    async def flush(
+        self, limit: int, retention: object, *, disable_spend_logs: bool = False, disable_error_logs: bool = False
+    ) -> list[dict[str, object]]:
         return self.written
 
     async def wait_idle(self) -> None:
@@ -269,6 +278,40 @@ async def test_an_outage_raises_a_native_failure_and_requeues_the_pass_at_the_he
     assert failure.value.kind == "unreachable"
     assert requeued == rows
     assert proxy_logging_obj.failure_handler.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_filtered_pass_only_parks_its_own_remaining_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.proxy import proxy_server
+
+    client: Final = FakePrismaClient()
+    writer: Final = await install_rust_spend_log_writer(client, await _unreachable_database(_REFUSED), _LEDGER_ON)
+    assert writer is not None
+    proxy_logging_obj: Final = _proxy_logging(parked=True)
+    monkeypatch.setattr(proxy_server, "disable_spend_logs", True)
+    await enqueue_spend_logs(client, [_row("drop"), _charged("charge"), _row("later")])
+
+    try:
+        with (
+            patch.object(RedisUpdateBuffer, "should_commit_spend_updates_to_redis", return_value=True),
+            pytest.raises(NativeDatabaseFailure),
+        ):
+            await flush_in_rust(writer, client, proxy_logging_obj, 2)
+
+        store: Final = proxy_logging_obj.db_spend_update_writer.redis_update_buffer.store_spend_logs_in_redis
+        (parked,) = store.await_args.args
+        assert tuple(parked) == (
+            {
+                "request_id": "charge",
+                "call_type": "acompletion",
+                "accounting_delivery_id": "charge-delivery",
+                "accounting_payload": {"spend": 1.5},
+                "accounting_log_disabled": True,
+            },
+        )
+        assert await dequeue_spend_logs(client, 10) == [_row("later")]
+    finally:
+        await uninstall_rust_spend_log_writer(client)
 
 
 @pytest.mark.asyncio

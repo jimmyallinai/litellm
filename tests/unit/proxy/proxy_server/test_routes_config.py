@@ -102,6 +102,23 @@ def test_config_update_persists_optional_pre_call_checks(client, auth_as, mock_p
     assert persisted["optional_pre_call_checks"] == ["prompt_caching"]
 
 
+def test_config_update_persists_request_log_flags(client, auth_as, mock_prisma, monkeypatch):
+    from litellm.proxy import proxy_server as ps
+    from litellm.proxy._types import LitellmUserRoles
+
+    table = _install_litellm_config(mock_prisma)
+    monkeypatch.setattr(ps, "prisma_client", mock_prisma)
+    config = ps.ProxyConfig()
+    monkeypatch.setattr(config, "add_deployment", AsyncMock())
+    monkeypatch.setattr(ps, "proxy_config", config)
+    flags = {"disable_spend_logs": True, "disable_error_logs": False}
+    with auth_as(LitellmUserRoles.PROXY_ADMIN):
+        response = client.post("/config/update", json={"general_settings": flags})
+
+    assert response.status_code == 200, response.text
+    assert json.loads(table.upsert.await_args.kwargs["data"]["update"]["param_value"]) == flags
+
+
 def test_config_update_persists_model_group_affinity_config(client, auth_as, mock_prisma, monkeypatch):
     from litellm.proxy import proxy_server as ps
     from litellm.proxy._types import LitellmUserRoles
@@ -396,6 +413,28 @@ def test_config_field_update_happy_admin(client, auth_as, mock_prisma, monkeypat
         "param_value": {"max_parallel_requests": 5},
         "id": "<VOLATILE>",
     }
+
+
+@pytest.mark.parametrize("flag", ["disable_spend_logs", "disable_error_logs"])
+def test_config_field_update_persists_request_log_flags(client, auth_as, mock_prisma, monkeypatch, flag):
+    from litellm.proxy import proxy_server as ps
+    from litellm.proxy._types import LitellmUserRoles
+
+    table = _install_litellm_config(mock_prisma)
+    table.find_first = AsyncMock(return_value=None)
+    table.upsert = AsyncMock(return_value={"param_value": {flag: True}})
+    monkeypatch.setattr(ps, "prisma_client", mock_prisma)
+    _seed_settings_store(monkeypatch, {})
+    monkeypatch.setattr(ps, "disable_spend_logs", False)
+
+    with auth_as(LitellmUserRoles.PROXY_ADMIN):
+        response = client.post(
+            "/config/field/update",
+            json={"field_name": flag, "field_value": True, "config_type": "general_settings"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert json.loads(table.upsert.await_args.kwargs["data"]["update"]["param_value"]) == {flag: True}
 
 
 def test_config_field_update_non_admin_rejected(client, auth_as, mock_prisma, monkeypatch):
