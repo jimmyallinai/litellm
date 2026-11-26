@@ -11,7 +11,8 @@ use litellm_repositories::{RawJson, Side, Team, TeamRepository};
 
 use crate::{
     Error,
-    key::{column, member, nullable, nullable_list, time},
+    column::{column, nullable, nullable_list, time},
+    member::member,
 };
 
 /// The team as the database holds it, in the shape the auth cache holds it: the row with its
